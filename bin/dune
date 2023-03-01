@@ -1,0 +1,4 @@
+(executable
+ (public_name enma)
+ (name main)
+ (libraries enma))
