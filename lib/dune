@@ -1,2 +1,13 @@
 (library
- (name enma))
+  (name enma)
+  (libraries core)
+  (inline_tests)
+  (preprocess (pps ppx_jane ppx_inline_test ppx_let))
+)
+
+(env
+ (dev
+  (flags
+   (:standard -w -20 -w -27 -w -32 -w -33 -w -34 -w -35 -w -37 -w -39)))
+ (release
+  (flags (:standard))))

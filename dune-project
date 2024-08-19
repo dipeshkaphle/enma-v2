@@ -18,8 +18,8 @@
 (package
  (name enma)
  (synopsis "enmav2")
- (description "enmav2")
- (depends ocaml dune)
+ (description "Enma language(Typed Lisp)")
+ (depends ocaml dune core)
  )
 
 ; See the complete stanza docs at https://dune.readthedocs.io/en/stable/dune-files.html#dune-project
