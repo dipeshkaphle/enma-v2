@@ -1,8 +1,12 @@
 open Core
 
 type name = string [@@deriving sexp]
+type trait = name [@@deriving sexp]
 
-type typ = SimpleTy of name * typ list | ArrowTy of name * typ
+type typ =
+  | SimpleTy of name * typ list
+  | ConstrGenericTy of name * trait
+  | ArrowTy of typ * typ
 [@@deriving sexp]
 
 type 'a typed = { ty : typ; content : 'a } [@@deriving sexp]
