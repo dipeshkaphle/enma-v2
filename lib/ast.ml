@@ -41,6 +41,7 @@ and stmt =
   | Expr of expr
   | FnDecl of named_abs_t
   | RecordDecl of record_t
+  | Let of name * expr
   | EnumDecl
 [@@deriving sexp]
 

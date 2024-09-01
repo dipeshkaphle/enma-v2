@@ -189,7 +189,7 @@ let rec parse_fn_input_params_and_return_type l =
 (* Loosely typed lambda: (fn (x y) (<body>) ) , type inferred from usage *)
 (* generic lambda: (fn (forall (a Debug) (b Iterable)) ((x a) (y b)) (<body>) ) , type inferred from usage *)
 (* generic lambda: (fn (forall a b) ((x a) (y b)) (<body>) ) , type inferred from usage *)
-let parse_fn_expression (t : Sexp.t list) : Ast.abs_t parse_result =
+let rec parse_fn_expression (t : Sexp.t list) : Ast.abs_t parse_result =
   match t with
   | [ foralls; type_decl; body ] ->
       Result.Let_syntax.(
@@ -199,7 +199,7 @@ let parse_fn_expression (t : Sexp.t list) : Ast.abs_t parse_result =
           parse_fn_input_params_and_return_type type_decl_as_list
         in
         (*TODO: Parse function body *)
-        let body = [] in
+        let%bind body = get_list_result body >>= parse_fn_body in
         let lam : Ast.abs_t =
           { type_params; params = input_type_params; ret_type; body }
         in
@@ -211,18 +211,27 @@ let parse_fn_expression (t : Sexp.t list) : Ast.abs_t parse_result =
           parse_fn_input_params_and_return_type type_decl_as_list
         in
         (*TODO: Parse function body *)
-        let body = [] in
+        let%bind body = get_list_result body >>= parse_fn_body in
         let lam : Ast.abs_t =
           { type_params = []; params = input_type_params; ret_type; body }
         in
         Result.return lam)
   | _ -> Result.fail (ParseFailure (Sexp.List t, "Cannot parse"))
 
+and parse_fn_body (t : Sexp.t list) =
+  match t with
+  | [] -> Result.return []
+  | hd :: tl ->
+      let open Result.Let_syntax in
+      let%bind first_stmt = parse_stmt_from_sexp hd in
+      let%bind rest = parse_fn_body tl in
+      return (first_stmt :: rest)
+
 (* Explicity typed function declaration: (fn foo ((x int) (y bool) returns int) (<body>) ) *)
 (* Loosely typed function declaration: (fn foo (x y) (<body>) ) , type inferred *)
 (* generic function: (fn (forall (a Debug) (b Iterable)) ((x a) (y b)) (<body>)) , type inferred from usage *)
 (* generic function: (fn (forall a b) ((x a) (y b)) (<body>)) , type inferred from usage *)
-let parse_fn (t : Sexp.t list) =
+and parse_fn (t : Sexp.t list) =
   match t with
   | name :: rest ->
       Result.Let_syntax.(
@@ -233,7 +242,7 @@ let parse_fn (t : Sexp.t list) =
 
 (* (record foo ((x int) (y int)))  *)
 (* (record foo (forall a) ((x int) (y int) (z a)))  *)
-let parse_record (t : Sexp.t list) =
+and parse_record (t : Sexp.t list) =
   match t with
   | name :: rest -> (
       Result.Let_syntax.(
@@ -259,51 +268,72 @@ let parse_record (t : Sexp.t list) =
   | _ -> Result.fail (ParseFailure (Sexp.List t, "Cannot parse"))
 
 (* (enum (option a) ((Some a) (None)))  *)
-let parse_enum (t : Sexp.t list) = Result.return Ast.EnumDecl
+and parse_enum (t : Sexp.t list) = Result.return Ast.EnumDecl
 
-let transform_sexp (t : Sexp.t) : Ast.Statement.t =
+and parse_let_binding (t : Sexp.t list) =
+  Result.fail (ParseFailure (Sexp.List t, "Unimplemented"))
+
+and parse_expression (t : Sexp.t) : Ast.expr parse_result =
   match t with
-  | Sexp.Atom s ->
+  | Sexp.Atom s -> (
       let open Ast in
       let ast =
         try_all s
           [
             (fun s ->
               (*Try to parse int*)
-              s |> Int64.of_string_opt |> Option.map ~f:(fun x -> Expr (Int x)));
+              s |> Int64.of_string_opt |> Option.map ~f:(fun x -> Int x));
             (fun s ->
               (*Try to parse float*)
-              s |> Float.of_string_opt
-              |> Option.map ~f:(fun x -> Expr (Float x)));
+              s |> Float.of_string_opt |> Option.map ~f:(fun x -> Float x));
             (fun s ->
               (* Try to parse identifier *)
-              s |> ensure_valid_identifier
-              |> Option.map ~f:(fun s -> Expr (Ident s)));
+              s |> ensure_valid_identifier |> Option.map ~f:(fun s -> Ident s));
           ]
       in
-      Option.value_exn
-        ~message:("None of the rules match with given atom:" ^ s)
-        ast
+      match ast with
+      | Some x -> Result.return x
+      | None -> Result.fail (ParseFailure (t, "Failed to parse expression")))
+  | Sexp.List l -> (
+      match l with
+      | [] -> Result.fail (ParseFailure (t, "Failed to parse expression"))
+      | hd :: tl ->
+          let open Result.Let_syntax in
+          let%bind fn_name = get_atom_result hd in
+          let%bind args =
+            lift_result_from_list (List.map ~f:get_atom_result tl)
+          in
+          return (Ast.App { fn = fn_name; args }))
+
+and parse_stmt_from_sexp (t : Sexp.t) : Ast.Statement.t parse_result =
+  let open Result.Let_syntax in
+  match t with
+  | Sexp.Atom s -> parse_expression t >>= fun e -> return (Ast.Expr e)
   | Sexp.List [] -> raise (ParseFailure (t, "empty sexp cannot be parsed"))
   | Sexp.List (hd :: tl) ->
       let identifier = get_atom_exn hd in
       if is_valid_identifier identifier then
         match identifier with
-        | _ when String.equal identifier Keywords.record ->
-            Result.ok_exn (parse_record tl)
-        | _ when String.equal identifier Keywords.fn ->
-            Result.ok_exn (parse_fn tl)
-        | _ when String.equal identifier Keywords.enum ->
-            Result.ok_exn (parse_enum tl)
-        | _ -> failwith (Format.sprintf "%s is an unknown keyword" identifier)
-      else failwith (Format.sprintf "%s is not a valid identifier" identifier)
+        | _ when String.equal identifier Keywords.record -> parse_record tl
+        | _ when String.equal identifier Keywords.fn -> parse_fn tl
+        | _ when String.equal identifier Keywords.enum -> parse_enum tl
+        | _ when String.equal identifier Keywords.let_ -> parse_let_binding tl
+        | _ -> parse_expression t >>= fun e -> return (Ast.Expr e)
+      else
+        Result.fail
+          (ParseFailure
+             (t, Format.sprintf "%s is not a valid identifier" identifier))
 
-let parse s =
-  Sexp.of_string_many_conv_exn s transform_sexp |> Ast.Program.of_list
+and parse s =
+  Sexp.of_string_many_conv_exn s parse_stmt_from_sexp |> lift_result_from_list
+
+let parse_exn s =
+  Sexp.of_string_many_conv_exn s parse_stmt_from_sexp
+  |> lift_result_from_list |> Result.ok_exn |> Ast.Program.of_list
 
 let parse_and_print ast =
   print_endline @@ Sexplib.Sexp.to_string_hum @@ Ast.Program.sexp_of_t
-  @@ parse ast
+  @@ parse_exn ast
 
 (** TESTS **)
 
@@ -360,7 +390,8 @@ let%expect_test "functions parsing" =
          (params
           (((ty ((SimpleTy int ()))) (content x))
            ((ty ((SimpleTy bool ()))) (content y))))
-         (ret_type ((SimpleTy int ()))) (body ()))))))
+         (ret_type ((SimpleTy int ())))
+         (body ((Expr (App (fn f) (args (y)))) (Expr (App (fn g) (args (x)))))))))))
     |}];
   parse_and_print "(fn foo (x y) () )";
   [%expect
@@ -381,9 +412,10 @@ let%expect_test "functions parsing" =
          (params
           (((ty ((SimpleTy int ()))) (content x))
            ((ty ((SimpleTy bool ()))) (content y))))
-         (ret_type ((SimpleTy int ()))) (body ()))))))
+         (ret_type ((SimpleTy int ())))
+         (body ((Expr (App (fn f) (args (x)))) (Expr (App (fn g) (args (y)))))))))))
     |}];
-  parse_and_print "(fn foo ((x int) (y bool) returns int) ((f x ) (g y)) )";
+  parse_and_print "(fn foo ((x int) (y bool) returns int) ((f x y) (g y x)) )";
   [%expect
     {|
     ((FnDecl
@@ -393,5 +425,15 @@ let%expect_test "functions parsing" =
          (params
           (((ty ((SimpleTy int ()))) (content x))
            ((ty ((SimpleTy bool ()))) (content y))))
-         (ret_type ((SimpleTy int ()))) (body ()))))))
+         (ret_type ((SimpleTy int ())))
+         (body
+          ((Expr (App (fn f) (args (x y)))) (Expr (App (fn g) (args (y x)))))))))))
     |}]
+
+let%expect_test "expressions parsing" =
+  parse_and_print "1";
+  [%expect {| ((Expr (Int 1))) |}];
+  parse_and_print "1.2";
+  [%expect {| ((Expr (Float 1.2))) |}];
+  parse_and_print "(f x)";
+  [%expect {| ((Expr (App (fn f) (args (x))))) |}]

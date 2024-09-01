@@ -20,7 +20,7 @@ let simple_parser_test () =
           "Check parser"
           (Sexp.equal
              (E.Ast.Statement.sexp_of_t
-                (List.hd_exn @@ E.Ast.Program.to_list @@ E.Parser.parse s))
+                (List.hd_exn @@ E.Ast.Program.to_list @@ E.Parser.parse_exn s))
              (E.Ast.Statement.sexp_of_t e))
           true)
       (List.zip_exn expressions expected_asts)
