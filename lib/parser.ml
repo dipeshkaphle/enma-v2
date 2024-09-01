@@ -190,6 +190,11 @@ let rec parse_fn_input_params_and_return_type l =
 (* generic lambda: (fn (forall (a Debug) (b Iterable)) ((x a) (y b)) (<body>) ) , type inferred from usage *)
 (* generic lambda: (fn (forall a b) ((x a) (y b)) (<body>) ) , type inferred from usage *)
 let rec parse_fn_expression (t : Sexp.t list) : Ast.abs_t parse_result =
+  let handle_empty_input_params l =
+    if List.is_empty l then
+      [ { Ast.content = "_"; ty = Some (Ast.SimpleTy ("unit", [])) } ]
+    else l
+  in
   match t with
   | [ foralls; type_decl; body ] ->
       Result.Let_syntax.(
@@ -201,7 +206,12 @@ let rec parse_fn_expression (t : Sexp.t list) : Ast.abs_t parse_result =
         (*TODO: Parse function body *)
         let%bind body = get_list_result body >>= parse_fn_body in
         let lam : Ast.abs_t =
-          { type_params; params = input_type_params; ret_type; body }
+          {
+            type_params;
+            params = handle_empty_input_params input_type_params;
+            ret_type;
+            body;
+          }
         in
         Result.return lam)
   | [ type_decl; body ] ->
@@ -213,7 +223,12 @@ let rec parse_fn_expression (t : Sexp.t list) : Ast.abs_t parse_result =
         (*TODO: Parse function body *)
         let%bind body = get_list_result body >>= parse_fn_body in
         let lam : Ast.abs_t =
-          { type_params = []; params = input_type_params; ret_type; body }
+          {
+            type_params = [];
+            params = handle_empty_input_params input_type_params;
+            ret_type;
+            body;
+          }
         in
         Result.return lam)
   | _ -> Result.fail (ParseFailure (Sexp.List t, "Cannot parse"))
@@ -221,11 +236,17 @@ let rec parse_fn_expression (t : Sexp.t list) : Ast.abs_t parse_result =
 and parse_fn_body (t : Sexp.t list) =
   match t with
   | [] -> Result.return []
-  | hd :: tl ->
+  | hd :: tl -> (
       let open Result.Let_syntax in
-      let%bind first_stmt = parse_stmt_from_sexp hd in
-      let%bind rest = parse_fn_body tl in
-      return (first_stmt :: rest)
+      match hd with
+      | Sexp.Atom _ ->
+          Result.fail
+            (ParseFailure
+               (hd, "Everything should be a list sexp inside function body"))
+      | Sexp.List _ ->
+          let%bind first_stmt = parse_stmt_from_sexp hd in
+          let%bind rest = parse_fn_body tl in
+          return (first_stmt :: rest))
 
 (* Explicity typed function declaration: (fn foo ((x int) (y bool) returns int) (<body>) ) *)
 (* Loosely typed function declaration: (fn foo (x y) (<body>) ) , type inferred *)
@@ -271,7 +292,14 @@ and parse_record (t : Sexp.t list) =
 and parse_enum (t : Sexp.t list) = Result.return Ast.EnumDecl
 
 and parse_let_binding (t : Sexp.t list) =
-  Result.fail (ParseFailure (Sexp.List t, "Unimplemented"))
+  let open Result.Let_syntax in
+  match t with
+  | [ name; binding_expr ] ->
+      let%bind name = get_atom_result name in
+      let%bind expr = parse_expression binding_expr in
+      return @@ Ast.Let (name, expr)
+  | _ ->
+      Result.fail (ParseFailure (Sexp.List t, "Expected <id> <expr> after let"))
 
 and parse_expression (t : Sexp.t) : Ast.expr parse_result =
   match t with
@@ -297,13 +325,19 @@ and parse_expression (t : Sexp.t) : Ast.expr parse_result =
   | Sexp.List l -> (
       match l with
       | [] -> Result.fail (ParseFailure (t, "Failed to parse expression"))
-      | hd :: tl ->
+      | hd :: tl -> (
           let open Result.Let_syntax in
-          let%bind fn_name = get_atom_result hd in
-          let%bind args =
-            lift_result_from_list (List.map ~f:get_atom_result tl)
-          in
-          return (Ast.App { fn = fn_name; args }))
+          let%bind id = get_atom_result hd in
+          match id with
+          | identifier when String.equal identifier Keywords.fn ->
+              let%bind fn_abs = parse_fn_expression tl in
+              return @@ Ast.Lam fn_abs
+          | _ ->
+              let%bind args =
+                lift_result_from_list (List.map ~f:get_atom_result tl)
+              in
+              if List.is_empty args then return (Ast.Ident id)
+              else return (Ast.App { fn = id; args })))
 
 and parse_stmt_from_sexp (t : Sexp.t) : Ast.Statement.t parse_result =
   let open Result.Let_syntax in
@@ -332,8 +366,10 @@ let parse_exn s =
   |> lift_result_from_list |> Result.ok_exn |> Ast.Program.of_list
 
 let parse_and_print ast =
-  print_endline @@ Sexplib.Sexp.to_string_hum @@ Ast.Program.sexp_of_t
-  @@ parse_exn ast
+  try
+    print_endline @@ Sexplib.Sexp.to_string_hum @@ Ast.Program.sexp_of_t
+    @@ parse_exn ast
+  with e -> print_endline @@ Exn.to_string e
 
 (** TESTS **)
 
@@ -436,4 +472,59 @@ let%expect_test "expressions parsing" =
   parse_and_print "1.2";
   [%expect {| ((Expr (Float 1.2))) |}];
   parse_and_print "(f x)";
-  [%expect {| ((Expr (App (fn f) (args (x))))) |}]
+  [%expect {| ((Expr (App (fn f) (args (x))))) |}];
+  parse_and_print "(let f (fn () ((plus 1 2) (unit) )))";
+  [%expect {|
+    ((Let f
+      (Lam
+       ((type_params ()) (params (((ty ((SimpleTy unit ()))) (content _))))
+        (ret_type ())
+        (body ((Expr (App (fn plus) (args (1 2)))) (Expr (Ident unit))))))))
+    |}];
+  parse_and_print "(let f (fn (returns unit) ((plus 1 2) (unit) )))";
+  [%expect
+    {|
+    ((Let f
+      (Lam
+       ((type_params ()) (params (((ty ((SimpleTy unit ()))) (content _))))
+        (ret_type ((SimpleTy unit ())))
+        (body ((Expr (App (fn plus) (args (1 2)))) (Expr (Ident unit))))))))
+    |}];
+  parse_and_print "(let f (fn (x y) ((plus x y))))";
+  [%expect
+    {|
+    ((Let f
+      (Lam
+       ((type_params ()) (params (((ty ()) (content x)))) (ret_type ())
+        (body ((Expr (App (fn plus) (args (x y))))))))))
+    |}];
+  parse_and_print "(let f (fn (x y) (( plus x y ))))";
+  [%expect
+    {|
+    ((Let f
+      (Lam
+       ((type_params ()) (params (((ty ()) (content x)))) (ret_type ())
+        (body ((Expr (App (fn plus) (args (x y))))))))))
+    |}];
+  parse_and_print "(let f (fn (x y) ((let res (plus x y)) ( res ) )))";
+  [%expect
+    {|
+    ((Let f
+      (Lam
+       ((type_params ()) (params (((ty ()) (content x)))) (ret_type ())
+        (body ((Let res (App (fn plus) (args (x y)))) (Expr (Ident res))))))))
+    |}];
+  parse_and_print "(let f (fn (x y) ( plus x y)))";
+  [%expect
+    {|
+    (lib/parser.ml.CombinedFailure
+      ((lib/parser.ml.ParseFailure plus
+         "Everything should be a list sexp inside function body")))
+    |}];
+  parse_and_print "(let f (fn (x y) ( ( let sm_xy ( plus x y ) ) sm_xy )))";
+  [%expect
+    {|
+    (lib/parser.ml.CombinedFailure
+      ((lib/parser.ml.ParseFailure sm_xy
+         "Everything should be a list sexp inside function body")))
+    |}]
