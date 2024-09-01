@@ -85,18 +85,30 @@ let parse_record_field : Sexp.t -> Ast.field_t parse_result =
   | _ ->
       Result.fail
         (ParseFailure
-           (t, "Cannot parse record field because there's no type specified"))
+           ( t,
+             "Cannot parse (<id> <type>) because there's no type specified and \
+              syntax isn't right" ))
+
+(* let parse_input_parameter : Sexp.t -> Ast.name Ast.maybe_typed parse_result = *)
+(*  fun t -> *)
+(*  let open Result.Let_syntax in *)
+(*   match t with *)
+(*   | Sexp.List [ name; ty ] -> *)
+(*         let%bind field_name = get_atom_result name in *)
+(*         let%bind ty = parse_type ty in *)
+(*         return { Ast.content = field_name; ty=(Some ty) } *)
+(*   | Sexp.Atom name -> return {Ast.content = name ; ty = None} *)
+(*   | _ -> *)
+(*       Result.fail *)
+(*         (ParseFailure *)
+(*            ( t, *)
+(* "Cannot parse (<id> <type>) because there's no type specified and \ *)
+   (*               syntax isn't right" )) *)
 
 let parse_record_fields : Sexp.t -> Ast.field_t list parse_result =
  fun fields ->
   match fields with
   | Sexp.List l ->
-      (* let parsed_fields = List.map l ~f:parse_record_field in *)
-      (* if List.for_all parsed_fields ~f:Result.is_ok then *)
-      (*   Result.return (List.map ~f:Result.ok_exn parsed_fields) *)
-      (* else *)
-      (*   Result.fail *)
-      (*     (CombinedFailure (List.filter_map parsed_fields ~f:map_exn_to_some)) *)
       Result.Let_syntax.(
         let%bind parsed_fields =
           lift_result_from_list @@ List.map l ~f:parse_record_field
@@ -147,23 +159,62 @@ let parse_forall = function
           Result.fail (ParseFailure (forall_token, "Expected forall keyword")))
   | _ as t -> Result.fail (ParseFailure (t, "Expected (forall <typeparams> )"))
 
+(* Parses something like this ((x int) (y bool) returns int) *)
+let rec parse_fn_input_params_and_return_type l =
+  let open Result.Let_syntax in
+  match l with
+  | [] -> return ([], None)
+  | hd :: tl -> (
+      let hd_as_atom = get_atom hd in
+      match hd_as_atom with
+      | Some atom when String.equal atom Keywords.returns ->
+          let%bind ret_type = parse_type (Sexp.List tl) in
+          return ([], Option.some ret_type)
+      | Some atom -> return ([ { Ast.content = atom; ty = None } ], None)
+      | None ->
+          (*must mean it's a list and we can continue parsing input param of form (<id> <type>)*)
+          let%bind input_type_param = parse_record_field hd in
+          let%bind rest_of_input_type_params, ret =
+            parse_fn_input_params_and_return_type tl
+          in
+          return
+            ( {
+                Ast.content = input_type_param.name;
+                ty = Some input_type_param.ty;
+              }
+              :: rest_of_input_type_params,
+              ret ))
+
 (* Explicity typed lambda: (fn ((x int) (y bool) returns int) (<body>) ) *)
 (* Loosely typed lambda: (fn (x y) (<body>) ) , type inferred from usage *)
 (* generic lambda: (fn (forall (a Debug) (b Iterable)) ((x a) (y b)) (<body>) ) , type inferred from usage *)
 (* generic lambda: (fn (forall a b) ((x a) (y b)) (<body>) ) , type inferred from usage *)
 let parse_fn_expression (t : Sexp.t list) : Ast.abs_t parse_result =
   match t with
-  | [ foralls; params; body ] ->
-      Result.fail (ParseFailure (Sexp.List t, "Unimplemented"))
-  | [ params; body ] ->
+  | [ foralls; type_decl; body ] ->
       Result.Let_syntax.(
-        (*TODO: parse parameters declaration*)
-        let params = [] in
-        (*TODO: parse lambda body declaration*)
+        let%bind type_params = parse_forall foralls in
+        let%bind type_decl_as_list = get_list_result type_decl in
+        let%bind input_type_params, ret_type =
+          parse_fn_input_params_and_return_type type_decl_as_list
+        in
+        (*TODO: Parse function body *)
         let body = [] in
-        (*TODO: parse return type declaration*)
-        let ret_type = None in
-        let lam : Ast.abs_t = { type_params = []; params; ret_type; body } in
+        let lam : Ast.abs_t =
+          { type_params; params = input_type_params; ret_type; body }
+        in
+        Result.return lam)
+  | [ type_decl; body ] ->
+      Result.Let_syntax.(
+        let%bind type_decl_as_list = get_list_result type_decl in
+        let%bind input_type_params, ret_type =
+          parse_fn_input_params_and_return_type type_decl_as_list
+        in
+        (*TODO: Parse function body *)
+        let body = [] in
+        let lam : Ast.abs_t =
+          { type_params = []; params = input_type_params; ret_type; body }
+        in
         Result.return lam)
   | _ -> Result.fail (ParseFailure (Sexp.List t, "Cannot parse"))
 
@@ -177,7 +228,7 @@ let parse_fn (t : Sexp.t list) =
       Result.Let_syntax.(
         let%bind name = get_atom_result name in
         let%bind fn = parse_fn_expression rest in
-        return @@ Ast.FnDecl { name; abs = fn })
+        return @@ Ast.FnDecl { name; lambda = fn })
   | _ -> Result.fail (ParseFailure (Sexp.List t, "Cannot parse"))
 
 (* (record foo ((x int) (y int)))  *)
@@ -250,4 +301,97 @@ let transform_sexp (t : Sexp.t) : Ast.Statement.t =
 let parse s =
   Sexp.of_string_many_conv_exn s transform_sexp |> Ast.Program.of_list
 
+let parse_and_print ast =
+  print_endline @@ Sexplib.Sexp.to_string_hum @@ Ast.Program.sexp_of_t
+  @@ parse ast
+
+(** TESTS **)
+
+(* Mostly has just the happy paths,TODO: cover more paths *)
 let%test "sanity test" = 1 = 1
+
+let%expect_test "record parsing" =
+  parse_and_print "(record foo ((x int) (y int)))";
+  [%expect
+    {|
+    ((RecordDecl
+      ((name foo) (type_params ())
+       (fields
+        (((name x) (ty (SimpleTy int ()))) ((name y) (ty (SimpleTy int ()))))))))
+    |}];
+  parse_and_print
+    "(record foo (forall a) \n\
+    \        ((x int) \n\
+    \        (y int) \n\
+    \        (z a))\n\
+    \    )";
+  [%expect
+    {|
+    ((RecordDecl
+      ((name foo) (type_params ((ConstrGenericTy a Any)))
+       (fields
+        (((name x) (ty (SimpleTy int ()))) ((name y) (ty (SimpleTy int ())))
+         ((name z) (ty (SimpleTy a ()))))))))
+    |}];
+  parse_and_print
+    "(record foo (forall (a Showable)) \n\
+    \        ((x int) \n\
+    \        (y int) \n\
+    \        (z a))\n\
+    \    )";
+
+  [%expect
+    {|
+    ((RecordDecl
+      ((name foo) (type_params ((ConstrGenericTy a Showable)))
+       (fields
+        (((name x) (ty (SimpleTy int ()))) ((name y) (ty (SimpleTy int ())))
+         ((name z) (ty (SimpleTy a ()))))))))
+    |}]
+
+let%expect_test "functions parsing" =
+  parse_and_print "(fn foo ((x int) (y bool) returns int) ( (f y) (g x) ) )";
+  [%expect
+    {|
+    ((FnDecl
+      ((name foo)
+       (lambda
+        ((type_params ())
+         (params
+          (((ty ((SimpleTy int ()))) (content x))
+           ((ty ((SimpleTy bool ()))) (content y))))
+         (ret_type ((SimpleTy int ()))) (body ()))))))
+    |}];
+  parse_and_print "(fn foo (x y) () )";
+  [%expect
+    {|
+    ((FnDecl
+      ((name foo)
+       (lambda
+        ((type_params ()) (params (((ty ()) (content x)))) (ret_type ())
+         (body ()))))))
+    |}];
+  parse_and_print "(fn foo ((x int) (y bool) returns int) ((f x) (g y) ) )";
+  [%expect
+    {|
+    ((FnDecl
+      ((name foo)
+       (lambda
+        ((type_params ())
+         (params
+          (((ty ((SimpleTy int ()))) (content x))
+           ((ty ((SimpleTy bool ()))) (content y))))
+         (ret_type ((SimpleTy int ()))) (body ()))))))
+    |}];
+  parse_and_print "(fn foo ((x int) (y bool) returns int) ((f x ) (g y)) )";
+  [%expect
+    {|
+    ((FnDecl
+      ((name foo)
+       (lambda
+        ((type_params ())
+         (params
+          (((ty ((SimpleTy int ()))) (content x))
+           ((ty ((SimpleTy bool ()))) (content y))))
+         (ret_type ((SimpleTy int ()))) (body ()))))))
+    |}]

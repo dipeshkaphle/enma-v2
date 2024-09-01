@@ -27,7 +27,7 @@ type abs_t = {
 }
 [@@deriving sexp]
 
-and named_abs_t = { name : name; abs : abs_t } [@@deriving sexp]
+and named_abs_t = { name : name; lambda : abs_t } [@@deriving sexp]
 
 and expr =
   | Int of Int64.t
